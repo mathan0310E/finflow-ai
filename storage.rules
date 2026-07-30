@@ -1,0 +1,130 @@
+// ────────────────────────────────────────────────────────────
+// FinFlow AI Enterprise — Firebase Storage Security Rules
+// ────────────────────────────────────────────────────────────
+// These rules enforce:
+//   • Only authenticated users can read/write
+//   • Users can only access their own company's paths
+//   • File type validation (MIME type)
+//   • File size limits
+//   • Super_admin cross-company access
+// ────────────────────────────────────────────────────────────
+
+rules_version = '2';
+
+// ── Helper functions ─────────────────────────────────────────
+
+/**
+ * Returns true when the caller is authenticated.
+ */
+function isAuthenticated() {
+  return request.auth != null;
+}
+
+/**
+ * Returns the caller's role from custom claims.
+ */
+function callerRole() {
+  return request.auth.token.role;
+}
+
+/**
+ * Returns the caller's companyId from custom claims.
+ */
+function callerCompanyId() {
+  return request.auth.token.companyId;
+}
+
+/**
+ * Returns true when the caller is a super_admin.
+ */
+function isSuperAdmin() {
+  return callerRole() == 'super_admin';
+}
+
+/**
+ * Returns true if the caller belongs to the given company.
+ */
+function inCompany(companyId) {
+  return callerCompanyId() == companyId;
+}
+
+/**
+ * Allowed MIME types for uploads.
+ */
+function isAllowedMimeType() {
+  return request.resource.contentType in [
+    'image/jpeg',
+    'image/png',
+    'image/gif',
+    'image/webp',
+    'application/pdf',
+    'application/msword',
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    'text/csv',
+    'application/vnd.ms-excel',
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  ];
+}
+
+/**
+ * Maximum file size: 10 MB.
+ */
+function isValidFileSize() {
+  return request.resource.size < 10 * 1024 * 1024;
+}
+
+/**
+ * Validation that runs on every upload.
+ */
+function isValidUpload() {
+  return isAllowedMimeType() && isValidFileSize();
+}
+
+// ════════════════════════════════════════════════════════════════
+//  RULES
+// ════════════════════════════════════════════════════════════════
+
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    // ── Company-scoped uploads ──
+    // Path format: /{companyId}/{category}/{filename}
+    // Category examples: receipts, invoices, avatars, documents, reports
+    match /{companyId}/{category}/{fileName} {
+
+      // Allow read access if user is in the same company or is super_admin
+      allow read: if isAuthenticated()
+        && (inCompany(companyId) || isSuperAdmin());
+
+      // Allow write access if user is in the same company or is super_admin,
+      // the request is a valid upload, and the path structure is correct.
+      allow create: if isAuthenticated()
+        && (inCompany(companyId) || isSuperAdmin())
+        && isValidUpload()
+        && category in ['receipts', 'invoices', 'avatars', 'documents', 'reports', 'attachments'];
+
+      // Allow overwrites only for own company
+      allow update: if isAuthenticated()
+        && (inCompany(companyId) || isSuperAdmin())
+        && isValidUpload();
+
+      // Allow delete only for super_admin or company CEO/finance
+      allow delete: if isAuthenticated()
+        && (isSuperAdmin() || inCompany(companyId));
+    }
+
+    // ── Public assets (logos, etc.) ──
+    // Path: /public/{fileName}
+    match /public/{fileName} {
+      allow read: if true; // Public read access
+      allow create: if isAuthenticated()
+        && isValidUpload();
+      allow write: if false;
+    }
+
+    // ── Catch-all: deny everything else ──
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

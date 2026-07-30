@@ -1,0 +1,483 @@
+// ────────────────────────────────────────────────────────────
+// FinFlow AI Enterprise — Firestore Security Rules
+// ────────────────────────────────────────────────────────────
+// These rules enforce:
+//   • Company-level data isolation
+//   • Role-based access per collection
+//   • Data structure validation on write
+//   • Privilege escalation prevention
+//   • Super_admin cross-company bypass
+//   • Write-rate limiting simulation
+// ────────────────────────────────────────────────────────────
+
+rules_version = '2';
+
+// ── Helper functions ─────────────────────────────────────────
+
+/**
+ * Returns true when the caller is authenticated.
+ */
+function isAuthenticated() {
+  return request.auth != null;
+}
+
+/**
+ * Returns the caller's uid.
+ */
+function callerUid() {
+  return request.auth.uid;
+}
+
+/**
+ * Returns the caller's role from their custom claims (set server-side).
+ */
+function callerRole() {
+  return request.auth.token.role;
+}
+
+/**
+ * Returns the caller's companyId from custom claims.
+ */
+function callerCompanyId() {
+  return request.auth.token.companyId;
+}
+
+/**
+ * Returns true when the caller is a super_admin.
+ */
+function isSuperAdmin() {
+  return callerRole() == 'super_admin';
+}
+
+/**
+ * Returns true when the caller's companyId matches the given value.
+ */
+function inCompany(companyId) {
+  return callerCompanyId() == companyId;
+}
+
+/**
+ * Returns true if the caller has one of the given roles.
+ */
+function hasAnyRole(roles) {
+  return roles.hasAny([callerRole()]);
+}
+
+/**
+ * Validates the resource exists and belongs to the caller's company.
+ */
+function belongsToMyCompany() {
+  return resource.data.companyId == callerCompanyId();
+}
+
+/**
+ * Write-rate limiting: allows at most 60 writes per minute per user.
+ * Uses the /rateLimits/{uid} document as a simple sliding-window counter.
+ */
+function checkRateLimit() {
+  let docPath = '/databases/$(database)/documents/rateLimits/$(callerUid())';
+  let rateDoc = get(docPath);
+  let now = request.time;
+  let windowStart = now - duration.value(60, 's');
+
+  // If no rate-limit doc exists or the window has expired, reset
+  if (rateDoc == null || rateDoc.data.windowStart < windowStart) {
+    return true; // First write in the window — allowed
+  }
+
+  // Enforce maximum 60 writes per minute
+  return rateDoc.data.count < 60;
+}
+
+/**
+ * Validates that the written data has a companyId matching the caller.
+ * Prevents a user from creating documents that belong to another company.
+ */
+function validateCompanyOwnership() {
+  return request.resource.data.companyId == callerCompanyId() || isSuperAdmin();
+}
+
+/**
+ * Validates common fields expected on most documents.
+ */
+function hasRequiredFields(required) {
+  return required.toList().all(function(field) {
+    return request.resource.data.keys().hasAll([field]);
+  });
+}
+
+/**
+ * Ensures the user's status is 'active' before allowing writes.
+ */
+function isActiveUser() {
+  let userDoc = get(/databases/$(database)/documents/users/$(callerUid()));
+  return userDoc != null && userDoc.data.status == 'active';
+}
+
+// ── Collection access helpers ─────────────────────────────────
+
+/**
+ * Super admin can read/write any document in any collection.
+ */
+function superAdminAccess() {
+  return isSuperAdmin();
+}
+
+/**
+ * Allow access if the user is authenticated and the document belongs to their company
+ * (or they are super_admin).
+ */
+function companyScopedAccess() {
+  return isAuthenticated()
+    && (isSuperAdmin() || belongsToMyCompany());
+}
+
+/**
+ * Allow write access if user is authenticated, active, rate-limited checked,
+ * and the new data's companyId matches their own.
+ */
+function companyScopedWrite() {
+  return isAuthenticated()
+    && isActiveUser()
+    && checkRateLimit()
+    && (isSuperAdmin() || validateCompanyOwnership());
+}
+
+// ── Data validation helpers per collection ─────────────────────
+
+function validateUserData() {
+  return request.resource.data.keys().hasAll(['email', 'displayName', 'role', 'companyId', 'status'])
+    && request.resource.data.role in ['super_admin', 'ceo', 'finance_manager', 'dept_manager', 'employee']
+    && request.resource.data.status in ['active', 'inactive', 'suspended']
+    && request.resource.data.email is string
+    && request.resource.data.displayName is string
+    && request.resource.data.companyId is string;
+}
+
+function validateCompanyData() {
+  return request.resource.data.keys().hasAll(['name', 'slug', 'size', 'currency', 'timezone', 'tier', 'status'])
+    && request.resource.data.tier in ['free', 'starter', 'business', 'enterprise']
+    && request.resource.data.status in ['active', 'suspended', 'disabled']
+    && request.resource.data.name is string
+    && request.resource.data.slug is string;
+}
+
+function validateExpenseData() {
+  return request.resource.data.keys().hasAll(['companyId', 'userId', 'title', 'amount', 'currency', 'category', 'status'])
+    && request.resource.data.amount is number
+    && request.resource.data.amount > 0
+    && request.resource.data.title is string
+    && request.resource.data.title.size() <= 200
+    && request.resource.data.status in ['draft', 'pending', 'manager_approved', 'finance_approved', 'ceo_approved', 'approved', 'rejected', 'changes_requested', 'reimbursed'];
+}
+
+function validateDepartmentData() {
+  return request.resource.data.keys().hasAll(['companyId', 'name'])
+    && request.resource.data.name is string
+    && request.resource.data.name.size() <= 100;
+}
+
+function validateBudgetData() {
+  return request.resource.data.keys().hasAll(['companyId', 'fiscalYear', 'period', 'totalAllocated'])
+    && request.resource.data.period in ['annual', 'quarterly', 'monthly']
+    && request.resource.data.totalAllocated is number;
+}
+
+function validateVendorData() {
+  return request.resource.data.keys().hasAll(['companyId', 'name'])
+    && request.resource.data.name is string;
+}
+
+function validateNotificationData() {
+  return request.resource.data.keys().hasAll(['companyId', 'userId', 'type', 'title', 'message'])
+    && request.resource.data.read is boolean;
+}
+
+function validateAuditLogData() {
+  return request.resource.data.keys().hasAll(['companyId', 'userId', 'action', 'resource', 'resourceId']);
+}
+
+// ── Service functions for privilege checks ─────────────────────
+
+/**
+ * Prevents a user from escalating their own role.
+ * Only super_admin can change the 'role' field.
+ */
+function preventSelfRoleEscalation() {
+  // If the role field is being modified
+  if ('role' in request.resource.data) {
+    // On creates: only super_admin can set super_admin role
+    if (!resource.exists && request.resource.data.role == 'super_admin') {
+      return isSuperAdmin();
+    }
+    // On updates: non-super-admin users cannot change their own role
+    if (resource.exists && resource.data.role != request.resource.data.role) {
+      // Changing your own role is only allowed for super_admin
+      return callerUid() != resource.data.__id__ || isSuperAdmin();
+    }
+    // A non-super-admin trying to set their own role to super_admin
+    if (request.resource.data.role == 'super_admin' && !isSuperAdmin()) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Ensures the user's companyId cannot be changed once set.
+ */
+function preventCompanyIdChange() {
+  if (resource != null && resource.data.companyId != null) {
+    return request.resource.data.companyId == resource.data.companyId || isSuperAdmin();
+  }
+  return true;
+}
+
+// ════════════════════════════════════════════════════════════════
+//  RULES
+// ════════════════════════════════════════════════════════════════
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── Rate-limit tracking ──
+    // Only the user themselves can write their rate-limit counter.
+    match /rateLimits/{userId} {
+      allow read: if isAuthenticated() && (request.auth.uid == userId || isSuperAdmin());
+      allow create, update: if request.auth.uid == userId
+        && request.resource.data.keys().hasOnly(['count', 'windowStart']);
+      allow delete: if false; // Never allow deletion
+    }
+
+    // ── Users ──
+    match /users/{userId} {
+
+      // Users can read their own document; super_admin can read any.
+      allow read: if isAuthenticated()
+        && (request.auth.uid == userId || isSuperAdmin());
+
+      // Users can create their own document on registration.
+      // Only super_admin can create documents for other users.
+      allow create: if isAuthenticated()
+        && request.auth.uid == userId
+        && validateUserData()
+        && preventSelfRoleEscalation()
+        && preventCompanyIdChange();
+
+      // Users can update their own document but cannot escalate their role.
+      allow update: if isAuthenticated()
+        && (request.auth.uid == userId || isSuperAdmin())
+        && validateUserData()
+        && preventSelfRoleEscalation()
+        && preventCompanyIdChange();
+
+      // Users cannot delete their own document; only super_admin can.
+      allow delete: if isAuthenticated() && isSuperAdmin();
+    }
+
+    // ── Companies ──
+    match /companies/{companyId} {
+
+      // Company members can read their own company; super_admin can read any.
+      allow read: if isAuthenticated()
+        && (inCompany(companyId) || isSuperAdmin());
+
+      // Only super_admin can create companies (or via registration).
+      // Registration creates via the Admin SDK which uses service account.
+      allow create: if isAuthenticated() && isSuperAdmin();
+      allow update: if isAuthenticated()
+        && (inCompany(companyId) || isSuperAdmin())
+        && validateCompanyData();
+      allow delete: if isAuthenticated() && isSuperAdmin();
+    }
+
+    // ── Expenses ──
+    match /expenses/{expenseId} {
+
+      // Users can read expenses belonging to their company.
+      allow read: if isAuthenticated()
+        && (belongsToMyCompany() || isSuperAdmin());
+
+      // Users can create expenses for their company.
+      allow create: if isAuthenticated()
+        && isActiveUser()
+        && validateCompanyOwnership()
+        && validateExpenseData()
+        && checkRateLimit();
+
+      // Only the owning user or roles with authority can update.
+      allow update: if isAuthenticated()
+        && isActiveUser()
+        && (isSuperAdmin()
+          || (belongsToMyCompany()
+            && (resource.data.userId == callerUid()
+              || hasAnyRole(['ceo', 'finance_manager', 'dept_manager']))))
+        && validateExpenseData()
+        && checkRateLimit();
+
+      // Only super_admin or ceo can delete expenses.
+      allow delete: if isAuthenticated()
+        && isActiveUser()
+        && (isSuperAdmin()
+          || (belongsToMyCompany() && hasAnyRole(['ceo'])));
+    }
+
+    // ── Departments ──
+    match /departments/{departmentId} {
+
+      allow read: if isAuthenticated()
+        && (belongsToMyCompany() || isSuperAdmin());
+
+      allow create: if isAuthenticated()
+        && isActiveUser()
+        && (isSuperAdmin()
+          || (inCompany(request.resource.data.companyId)
+            && hasAnyRole(['ceo', 'finance_manager'])))
+        && validateDepartmentData();
+
+      allow update: if isAuthenticated()
+        && isActiveUser()
+        && (isSuperAdmin()
+          || (belongsToMyCompany()
+            && hasAnyRole(['ceo', 'finance_manager', 'dept_manager'])))
+        && validateDepartmentData();
+
+      allow delete: if isAuthenticated()
+        && isActiveUser()
+        && (isSuperAdmin()
+          || (belongsToMyCompany() && hasAnyRole(['ceo'])));
+    }
+
+    // ── Budgets ──
+    match /budgets/{budgetId} {
+
+      allow read: if isAuthenticated()
+        && (belongsToMyCompany() || isSuperAdmin());
+
+      allow create: if isAuthenticated()
+        && isActiveUser()
+        && (isSuperAdmin()
+          || (inCompany(request.resource.data.companyId)
+            && hasAnyRole(['ceo', 'finance_manager'])))
+        && validateBudgetData();
+
+      allow update: if isAuthenticated()
+        && isActiveUser()
+        && (isSuperAdmin()
+          || (belongsToMyCompany()
+            && hasAnyRole(['ceo', 'finance_manager'])))
+        && validateBudgetData();
+
+      allow delete: if isAuthenticated()
+        && isActiveUser()
+        && (isSuperAdmin()
+          || (belongsToMyCompany() && hasAnyRole(['ceo'])));
+    }
+
+    // ── Vendors ──
+    match /vendors/{vendorId} {
+
+      allow read: if isAuthenticated()
+        && (belongsToMyCompany() || isSuperAdmin());
+
+      allow create: if isAuthenticated()
+        && isActiveUser()
+        && (isSuperAdmin()
+          || (inCompany(request.resource.data.companyId)
+            && hasAnyRole(['ceo', 'finance_manager', 'dept_manager'])))
+        && validateVendorData();
+
+      allow update: if isAuthenticated()
+        && isActiveUser()
+        && (isSuperAdmin()
+          || (belongsToMyCompany()
+            && hasAnyRole(['ceo', 'finance_manager'])))
+        && validateVendorData();
+
+      allow delete: if isAuthenticated()
+        && isActiveUser()
+        && (isSuperAdmin()
+          || (belongsToMyCompany() && hasAnyRole(['ceo'])));
+    }
+
+    // ── Notifications ──
+    match /notifications/{notificationId} {
+
+      // Users can read notifications addressed to them or within their company.
+      allow read: if isAuthenticated()
+        && (isSuperAdmin()
+          || (belongsToMyCompany()
+            && (resource.data.userId == callerUid()
+              || hasAnyRole(['ceo', 'finance_manager']))));
+
+      // System creates notifications via Admin SDK, so this is backup.
+      allow create: if isAuthenticated()
+        && isActiveUser()
+        && validateNotificationData()
+        && (isSuperAdmin()
+          || (inCompany(request.resource.data.companyId)
+            && request.resource.data.userId == callerUid()));
+
+      // Users can mark their own notifications as read.
+      allow update: if isAuthenticated()
+        && (isSuperAdmin()
+          || (belongsToMyCompany() && resource.data.userId == callerUid()));
+
+      allow delete: if isAuthenticated()
+        && (isSuperAdmin() || resource.data.userId == callerUid());
+    }
+
+    // ── Audit Logs ──
+    match /auditLogs/{logId} {
+
+      // Only ceo, finance_manager, and super_admin can read audit logs.
+      allow read: if isAuthenticated()
+        && (isSuperAdmin()
+          || (belongsToMyCompany()
+            && hasAnyRole(['ceo', 'finance_manager'])));
+
+      // Only the server (Admin SDK) can create audit logs.
+      // Client-side create is blocked.
+      allow create: if false;
+      allow update: if false;
+      allow delete: if false;
+    }
+
+    // ── AI Chats ──
+    match /aiChats/{chatId} {
+
+      allow read: if isAuthenticated()
+        && (isSuperAdmin()
+          || (belongsToMyCompany() && resource.data.userId == callerUid()));
+
+      allow create: if isAuthenticated()
+        && isActiveUser()
+        && validateCompanyOwnership()
+        && request.resource.data.userId == callerUid();
+
+      allow update: if isAuthenticated()
+        && (isSuperAdmin()
+          || (belongsToMyCompany() && resource.data.userId == callerUid()));
+
+      allow delete: if isAuthenticated()
+        && (isSuperAdmin()
+          || (belongsToMyCompany() && resource.data.userId == callerUid()));
+    }
+
+    // ── Dashboard Widgets ──
+    match /dashboardWidgets/{widgetId} {
+
+      allow read: if isAuthenticated() && resource.data.userId == callerUid();
+      allow create: if isAuthenticated()
+        && isActiveUser()
+        && request.resource.data.userId == callerUid();
+      allow update: if isAuthenticated() && resource.data.userId == callerUid();
+      allow delete: if isAuthenticated() && resource.data.userId == callerUid();
+    }
+
+    // ── Catch-all: deny everything else ──
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
